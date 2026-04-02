@@ -1,66 +1,107 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
-from bs4 import BeautifulSoup
 import json
 import re
+import os
 import time
 
 app = Flask(__name__)
-CORS(app)  # Разрешаем запросы из Google Sheets
+CORS(app)
 
-# Простой кэш в памяти
 cache = {}
 
 def search_hltb(game_name):
-    """Поиск игры на HowLongToBeat"""
+    """Поиск игры на HowLongToBeat через их API"""
     print(f"Поиск игры: {game_name}")
     
-    # Очищаем название от года в скобках
-    clean_name = re.sub(r'\s*\([0-9]{4}\)\s*$', '', game_name)
+    # Очищаем название
+    clean_name = re.sub(r'\s*\([0-9]{4}\)\s*$', '', game_name).strip()
     
-    # URL для поиска
-    search_url = "https://howlongtobeat.com/search"
+    # API эндпоинт HLTB
+    url = "https://howlongtobeat.com/api/search"
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        'Referer': 'https://howlongtobeat.com/'
+        'Origin': 'https://howlongtobeat.com',
+        'Referer': 'https://howlongtobeat.com/',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache'
     }
     
     payload = {
         "searchType": "games",
         "searchTerms": [clean_name],
         "searchPage": 1,
-        "size": 5
+        "size": 10,
+        "style": "complete"
     }
     
     try:
-        response = requests.post(search_url, headers=headers, json=payload, timeout=10)
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        print(f"Статус ответа: {response.status_code}")
         
         if response.status_code == 200:
             data = response.json()
             
             if data.get('data') and len(data['data']) > 0:
-                game = data['data'][0]
+                # Ищем точное совпадение
+                best_match = None
+                best_score = 0
                 
-                # Извлекаем время прохождения (в часах)
-                gameplay_main = game.get('comp_main', 0) / 3600  # конвертируем секунды в часы
-                gameplay_main_extra = game.get('comp_plus', 0) / 3600
-                gameplay_completionist = game.get('comp_100', 0) / 3600
+                for game in data['data']:
+                    game_title = game.get('game_name', '').lower()
+                    clean_lower = clean_name.lower()
+                    
+                    # Проверяем точное совпадение
+                    if game_title == clean_lower:
+                        best_match = game
+                        break
+                    
+                    # Или частичное совпадение
+                    if clean_lower in game_title or game_title in clean_lower:
+                        score = len(game_title)
+                        if score > best_score:
+                            best_score = score
+                            best_match = game
+                
+                if not best_match:
+                    best_match = data['data'][0]
+                
+                # Получаем время (в секундах)
+                comp_main = best_match.get('comp_main', 0)
+                comp_plus = best_match.get('comp_plus', 0)
+                comp_100 = best_match.get('comp_100', 0)
+                
+                # Если значение очень маленькое (меньше 100), вероятно это уже часы
+                # HLTB хранит время в секундах, но иногда возвращает часы
+                if comp_main < 100 and comp_main > 0:
+                    # Это уже часы
+                    main_hours = comp_main
+                    plus_hours = comp_plus
+                    comp_hours = comp_100
+                else:
+                    # Конвертируем секунды в часы
+                    main_hours = comp_main / 3600 if comp_main > 0 else 0
+                    plus_hours = comp_plus / 3600 if comp_plus > 0 else 0
+                    comp_hours = comp_100 / 3600 if comp_100 > 0 else 0
                 
                 result = {
-                    'title': game.get('game_name', game_name),
-                    'mainStory': round(gameplay_main, 1),
-                    'mainStoryWithExtras': round(gameplay_main_extra, 1),
-                    'completionist': round(gameplay_completionist, 1)
+                    'title': best_match.get('game_name', clean_name),
+                    'mainStory': round(main_hours, 1),
+                    'mainStoryWithExtras': round(plus_hours, 1),
+                    'completionist': round(comp_hours, 1)
                 }
                 
                 print(f"Найдено: {result}")
                 return result
-        
-        print(f"Игра не найдена: {game_name}")
+            else:
+                print(f"Нет данных в ответе")
+        else:
+            print(f"Ошибка HTTP: {response.status_code}")
+            
         return None
         
     except Exception as e:
@@ -69,20 +110,22 @@ def search_hltb(game_name):
 
 @app.route('/')
 def home():
-    """Главная страница с инструкцией"""
     return jsonify({
         'service': 'HLTB API Proxy',
         'status': 'running',
         'endpoints': {
-            '/hltb': 'GET - поиск по названию игры',
-            '/steam/<steam_id>': 'GET - поиск по Steam ID'
+            '/hltb?game=НАЗВАНИЕ': 'GET - поиск по названию игры',
+            '/health': 'GET - проверка здоровья'
         },
         'example': '/hltb?game=The Witcher 3'
     })
 
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'})
+
 @app.route('/hltb', methods=['GET'])
 def get_hltb_by_name():
-    """Поиск по названию игры"""
     game_name = request.args.get('game')
     
     if not game_name:
@@ -96,25 +139,21 @@ def get_hltb_by_name():
     # Ищем игру
     result = search_hltb(game_name)
     
-    if result:
-        # Сохраняем в кэш на 24 часа
+    if result and result['mainStory'] > 0:
         cache[game_name] = result
         return jsonify(result)
     
-    return jsonify({'error': 'Game not found'}), 404
+    return jsonify({'error': 'Game not found', 'game': game_name}), 404
 
-@app.route('/steam/<steam_id>', methods=['GET'])
-def get_hltb_by_steam_id(steam_id):
-    """Поиск по Steam ID (если есть соответствие)"""
-    # Steam ID to HLTB mapping (можно расширять)
-    # Это упрощённый вариант, в реальности нужно базу данных
-    
-    # Пока просто заглушка
+@app.route('/debug/<game_name>')
+def debug(game_name):
+    """Отладочный эндпоинт"""
+    result = search_hltb(game_name)
     return jsonify({
-        'steam_id': steam_id,
-        'note': 'Для поиска по Steam ID нужна база соответствий',
-        'try': f'/hltb?game=название_игры'
+        'search': game_name,
+        'result': result
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
