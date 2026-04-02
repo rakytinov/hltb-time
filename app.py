@@ -1,131 +1,31 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
-import json
-import re
 import os
-import time
+import re
 
 app = Flask(__name__)
 CORS(app)
 
 cache = {}
 
-def search_hltb(game_name):
-    """Поиск игры на HowLongToBeat через их API"""
-    print(f"Поиск игры: {game_name}")
-    
-    # Очищаем название
-    clean_name = re.sub(r'\s*\([0-9]{4}\)\s*$', '', game_name).strip()
-    
-    # API эндпоинт HLTB
-    url = "https://howlongtobeat.com/api/search"
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Origin': 'https://howlongtobeat.com',
-        'Referer': 'https://howlongtobeat.com/',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache'
-    }
-    
-    payload = {
-        "searchType": "games",
-        "searchTerms": [clean_name],
-        "searchPage": 1,
-        "size": 10,
-        "style": "complete"
-    }
-    
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
-        print(f"Статус ответа: {response.status_code}")
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            if data.get('data') and len(data['data']) > 0:
-                # Ищем точное совпадение
-                best_match = None
-                best_score = 0
-                
-                for game in data['data']:
-                    game_title = game.get('game_name', '').lower()
-                    clean_lower = clean_name.lower()
-                    
-                    # Проверяем точное совпадение
-                    if game_title == clean_lower:
-                        best_match = game
-                        break
-                    
-                    # Или частичное совпадение
-                    if clean_lower in game_title or game_title in clean_lower:
-                        score = len(game_title)
-                        if score > best_score:
-                            best_score = score
-                            best_match = game
-                
-                if not best_match:
-                    best_match = data['data'][0]
-                
-                # Получаем время (в секундах)
-                comp_main = best_match.get('comp_main', 0)
-                comp_plus = best_match.get('comp_plus', 0)
-                comp_100 = best_match.get('comp_100', 0)
-                
-                # Если значение очень маленькое (меньше 100), вероятно это уже часы
-                # HLTB хранит время в секундах, но иногда возвращает часы
-                if comp_main < 100 and comp_main > 0:
-                    # Это уже часы
-                    main_hours = comp_main
-                    plus_hours = comp_plus
-                    comp_hours = comp_100
-                else:
-                    # Конвертируем секунды в часы
-                    main_hours = comp_main / 3600 if comp_main > 0 else 0
-                    plus_hours = comp_plus / 3600 if comp_plus > 0 else 0
-                    comp_hours = comp_100 / 3600 if comp_100 > 0 else 0
-                
-                result = {
-                    'title': best_match.get('game_name', clean_name),
-                    'mainStory': round(main_hours, 1),
-                    'mainStoryWithExtras': round(plus_hours, 1),
-                    'completionist': round(comp_hours, 1)
-                }
-                
-                print(f"Найдено: {result}")
-                return result
-            else:
-                print(f"Нет данных в ответе")
-        else:
-            print(f"Ошибка HTTP: {response.status_code}")
-            
-        return None
-        
-    except Exception as e:
-        print(f"Ошибка при поиске: {e}")
-        return None
-
 @app.route('/')
 def home():
     return jsonify({
-        'service': 'HLTB API Proxy',
+        'service': 'Game Time API',
         'status': 'running',
         'endpoints': {
-            '/hltb?game=НАЗВАНИЕ': 'GET - поиск по названию игры',
-            '/health': 'GET - проверка здоровья'
+            '/time?game=НАЗВАНИЕ': 'GET - время прохождения игры',
         },
-        'example': '/hltb?game=The Witcher 3'
+        'example': '/time?game=The Witcher 3'
     })
 
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'})
 
-@app.route('/hltb', methods=['GET'])
-def get_hltb_by_name():
+@app.route('/time', methods=['GET'])
+def get_game_time():
     game_name = request.args.get('game')
     
     if not game_name:
@@ -133,22 +33,90 @@ def get_hltb_by_name():
     
     # Проверяем кэш
     if game_name in cache:
-        print(f"Возвращаем из кэша: {game_name}")
         return jsonify(cache[game_name])
     
-    # Ищем игру
-    result = search_hltb(game_name)
+    # Ищем игру через RAWG API
+    result = search_rawg(game_name)
     
-    if result and result['mainStory'] > 0:
+    if result:
         cache[game_name] = result
         return jsonify(result)
     
     return jsonify({'error': 'Game not found', 'game': game_name}), 404
 
+def search_rawg(game_name):
+    """Поиск времени прохождения через RAWG API"""
+    print(f"Поиск в RAWG: {game_name}")
+    
+    # Очищаем название от года в скобках
+    clean_name = re.sub(r'\s*\([0-9]{4}\)\s*$', '', game_name).strip()
+    
+    # RAWG API (не требует ключа для базовых запросов)
+    url = "https://api.rawg.io/api/games"
+    params = {
+        'search': clean_name,
+        'page_size': 5
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        print(f"RAWG статус: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            if data.get('results') and len(data['results']) > 0:
+                # Ищем точное совпадение
+                best_match = None
+                for game in data['results']:
+                    game_title = game.get('name', '').lower()
+                    clean_lower = clean_name.lower()
+                    
+                    if game_title == clean_lower:
+                        best_match = game
+                        break
+                
+                if not best_match:
+                    best_match = data['results'][0]
+                
+                # playtime в часах
+                playtime = best_match.get('playtime', 0)
+                
+                result = {
+                    'title': best_match.get('name', clean_name),
+                    'playtime': playtime,
+                    'playtime_formatted': format_time(playtime)
+                }
+                
+                print(f"Найдено: {result}")
+                return result
+        
+        print(f"Игра не найдена: {clean_name}")
+        return None
+        
+    except Exception as e:
+        print(f"Ошибка RAWG: {e}")
+        return None
+
+def format_time(hours):
+    """Форматирует часы в читаемый вид"""
+    if hours <= 0:
+        return "Нет данных"
+    
+    whole_hours = int(hours)
+    minutes = int((hours - whole_hours) * 60)
+    
+    if whole_hours == 0:
+        return f"{minutes}м"
+    elif minutes == 0:
+        return f"{whole_hours}ч"
+    else:
+        return f"{whole_hours}ч {minutes}м"
+
 @app.route('/debug/<game_name>')
 def debug(game_name):
     """Отладочный эндпоинт"""
-    result = search_hltb(game_name)
+    result = search_rawg(game_name)
     return jsonify({
         'search': game_name,
         'result': result
